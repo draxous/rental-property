@@ -1,5 +1,18 @@
 // ── Core entities ──────────────────────────────────────────────────
 
+export interface Organization {
+  id: number;
+  name: string;
+  slug: string;
+  created_at: string;
+}
+
+export type NewOrganization = {
+  name: string;
+  slug?: string;
+  seed_demo_data?: boolean;
+};
+
 export type PropertyType = "single_family" | "multi_family" | "condo" | "townhouse" | "commercial";
 
 export interface Property {
