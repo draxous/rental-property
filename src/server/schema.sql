@@ -1,20 +1,56 @@
--- ── Settings (key/value) ─────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS settings (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL,
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+PRAGMA foreign_keys = OFF;
+
+-- ── Drop old tables if upgrading ─────────────────────────────────
+DROP TABLE IF EXISTS settings;
+DROP TABLE IF EXISTS lease_tenants;
+DROP TABLE IF EXISTS payments;
+DROP TABLE IF EXISTS rent_charges;
+DROP TABLE IF EXISTS work_orders;
+DROP TABLE IF EXISTS applications;
+DROP TABLE IF EXISTS leases;
+DROP TABLE IF EXISTS tenants;
+DROP TABLE IF EXISTS vendors;
+DROP TABLE IF EXISTS units;
+DROP TABLE IF EXISTS properties;
+DROP TABLE IF EXISTS organizations;
+
+-- ── Organizations ──────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS organizations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  slug TEXT UNIQUE NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-INSERT OR IGNORE INTO settings (key, value) VALUES ('default_rent_due_day', '1');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('late_fee_amount', '50');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('late_fee_grace_days', '5');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('currency', 'USD');
+-- Seed default organizations
+INSERT INTO organizations (id, name, slug) VALUES (1, 'Apex Property Group', 'apex-property-group');
+INSERT INTO organizations (id, name, slug) VALUES (2, 'Beacon Real Estate', 'beacon-real-estate');
+
+-- ── Settings (key/value per organization) ─────────────────────────
+CREATE TABLE IF NOT EXISTS settings (
+  org_id INTEGER NOT NULL DEFAULT 1 REFERENCES organizations(id) ON DELETE CASCADE,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (org_id, key)
+);
+
+INSERT INTO settings (org_id, key, value) VALUES (1, 'default_rent_due_day', '1');
+INSERT INTO settings (org_id, key, value) VALUES (1, 'late_fee_amount', '50');
+INSERT INTO settings (org_id, key, value) VALUES (1, 'late_fee_grace_days', '5');
+INSERT INTO settings (org_id, key, value) VALUES (1, 'currency', 'USD');
+
+INSERT INTO settings (org_id, key, value) VALUES (2, 'default_rent_due_day', '1');
+INSERT INTO settings (org_id, key, value) VALUES (2, 'late_fee_amount', '75');
+INSERT INTO settings (org_id, key, value) VALUES (2, 'late_fee_grace_days', '3');
+INSERT INTO settings (org_id, key, value) VALUES (2, 'currency', 'USD');
 
 -- ── Properties (buildings) ───────────────────────────────────────
 CREATE TABLE IF NOT EXISTS properties (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  org_id INTEGER NOT NULL DEFAULT 1 REFERENCES organizations(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
-  type TEXT NOT NULL DEFAULT 'single_family',  -- 'single_family' | 'multi_family' | 'condo' | 'townhouse' | 'commercial'
+  type TEXT NOT NULL DEFAULT 'single_family',
   address TEXT,
   city TEXT,
   state TEXT,
@@ -25,16 +61,18 @@ CREATE TABLE IF NOT EXISTS properties (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE INDEX IF NOT EXISTS idx_properties_org ON properties(org_id);
+
 -- ── Units (rentable spaces inside a property) ────────────────────
 CREATE TABLE IF NOT EXISTS units (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   property_id INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
-  name TEXT NOT NULL,                          -- e.g. 'Unit 1A', '308', 'Main house'
-  bedrooms REAL NOT NULL DEFAULT 1,            -- studio = 0, allows half-beds (rare)
-  bathrooms REAL NOT NULL DEFAULT 1,           -- allows half-baths (1.5)
+  name TEXT NOT NULL,
+  bedrooms REAL NOT NULL DEFAULT 1,
+  bathrooms REAL NOT NULL DEFAULT 1,
   sqft INTEGER,
   market_rent REAL NOT NULL DEFAULT 0,
-  status TEXT NOT NULL DEFAULT 'vacant',       -- 'vacant' | 'occupied' | 'turnover' | 'unavailable'
+  status TEXT NOT NULL DEFAULT 'vacant',
   notes TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -45,6 +83,7 @@ CREATE INDEX IF NOT EXISTS idx_units_status ON units(status);
 -- ── Tenants ──────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS tenants (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  org_id INTEGER NOT NULL DEFAULT 1 REFERENCES organizations(id) ON DELETE CASCADE,
   first_name TEXT NOT NULL,
   last_name TEXT NOT NULL,
   email TEXT,
@@ -57,29 +96,31 @@ CREATE TABLE IF NOT EXISTS tenants (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_tenants_name ON tenants(last_name, first_name);
+CREATE INDEX IF NOT EXISTS idx_tenants_org ON tenants(org_id);
+CREATE INDEX IF NOT EXISTS idx_tenants_name ON tenants(org_id, last_name, first_name);
 
 -- ── Leases ───────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS leases (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  org_id INTEGER NOT NULL DEFAULT 1 REFERENCES organizations(id) ON DELETE CASCADE,
   unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
   primary_tenant_id INTEGER REFERENCES tenants(id) ON DELETE SET NULL,
-  start_date TEXT NOT NULL,                    -- 'YYYY-MM-DD'
+  start_date TEXT NOT NULL,
   end_date TEXT NOT NULL,
   monthly_rent REAL NOT NULL DEFAULT 0,
   deposit REAL NOT NULL DEFAULT 0,
   rent_due_day INTEGER NOT NULL DEFAULT 1,
   late_fee REAL NOT NULL DEFAULT 0,
-  status TEXT NOT NULL DEFAULT 'active',       -- 'upcoming' | 'active' | 'ended' | 'cancelled'
+  status TEXT NOT NULL DEFAULT 'active',
   notes TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE INDEX IF NOT EXISTS idx_leases_org ON leases(org_id);
 CREATE INDEX IF NOT EXISTS idx_leases_unit ON leases(unit_id);
 CREATE INDEX IF NOT EXISTS idx_leases_tenant ON leases(primary_tenant_id);
 CREATE INDEX IF NOT EXISTS idx_leases_status ON leases(status);
 
--- Multi-tenant leases (occupants beyond the primary).
 CREATE TABLE IF NOT EXISTS lease_tenants (
   lease_id INTEGER NOT NULL REFERENCES leases(id) ON DELETE CASCADE,
   tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -90,11 +131,11 @@ CREATE TABLE IF NOT EXISTS lease_tenants (
 CREATE TABLE IF NOT EXISTS rent_charges (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   lease_id INTEGER NOT NULL REFERENCES leases(id) ON DELETE CASCADE,
-  period TEXT NOT NULL,                        -- 'YYYY-MM' (e.g. '2026-04')
-  due_date TEXT NOT NULL,                      -- 'YYYY-MM-DD'
+  period TEXT NOT NULL,
+  due_date TEXT NOT NULL,
   amount REAL NOT NULL DEFAULT 0,
   amount_paid REAL NOT NULL DEFAULT 0,
-  status TEXT NOT NULL DEFAULT 'open',         -- 'open' | 'partial' | 'paid' | 'overdue' | 'waived'
+  status TEXT NOT NULL DEFAULT 'open',
   notes TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -103,14 +144,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_charges_lease_period ON rent_charges(lease
 CREATE INDEX IF NOT EXISTS idx_charges_due ON rent_charges(due_date);
 CREATE INDEX IF NOT EXISTS idx_charges_status ON rent_charges(status);
 
--- ── Payments (applied to a charge) ───────────────────────────────
+-- ── Payments ─────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS payments (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   charge_id INTEGER NOT NULL REFERENCES rent_charges(id) ON DELETE CASCADE,
   paid_at TEXT NOT NULL DEFAULT (datetime('now')),
   amount REAL NOT NULL DEFAULT 0,
-  method TEXT NOT NULL DEFAULT 'cash',         -- 'cash' | 'check' | 'ach' | 'credit' | 'other'
-  reference TEXT,                              -- check number, transaction ID, etc.
+  method TEXT NOT NULL DEFAULT 'cash',
+  reference TEXT,
   notes TEXT
 );
 
@@ -119,8 +160,9 @@ CREATE INDEX IF NOT EXISTS idx_payments_charge ON payments(charge_id);
 -- ── Vendors ──────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS vendors (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  org_id INTEGER NOT NULL DEFAULT 1 REFERENCES organizations(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
-  category TEXT NOT NULL DEFAULT 'general',    -- 'plumber' | 'electrician' | 'hvac' | 'handyman' | 'cleaning' | 'landscaping' | 'general'
+  category TEXT NOT NULL DEFAULT 'general',
   phone TEXT,
   email TEXT,
   notes TEXT,
@@ -128,17 +170,20 @@ CREATE TABLE IF NOT EXISTS vendors (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- ── Work orders (maintenance) ────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_vendors_org ON vendors(org_id);
+
+-- ── Work orders ──────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS work_orders (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  org_id INTEGER NOT NULL DEFAULT 1 REFERENCES organizations(id) ON DELETE CASCADE,
   property_id INTEGER REFERENCES properties(id) ON DELETE SET NULL,
   unit_id INTEGER REFERENCES units(id) ON DELETE SET NULL,
-  tenant_id INTEGER REFERENCES tenants(id) ON DELETE SET NULL,  -- who reported it
+  tenant_id INTEGER REFERENCES tenants(id) ON DELETE SET NULL,
   vendor_id INTEGER REFERENCES vendors(id) ON DELETE SET NULL,
   title TEXT NOT NULL,
   description TEXT,
-  priority TEXT NOT NULL DEFAULT 'normal',     -- 'low' | 'normal' | 'high' | 'urgent'
-  status TEXT NOT NULL DEFAULT 'open',         -- 'open' | 'assigned' | 'in_progress' | 'completed' | 'cancelled'
+  priority TEXT NOT NULL DEFAULT 'normal',
+  status TEXT NOT NULL DEFAULT 'open',
   scheduled_at TEXT,
   completed_at TEXT,
   cost REAL,
@@ -146,13 +191,15 @@ CREATE TABLE IF NOT EXISTS work_orders (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE INDEX IF NOT EXISTS idx_wo_org ON work_orders(org_id);
 CREATE INDEX IF NOT EXISTS idx_wo_status ON work_orders(status);
 CREATE INDEX IF NOT EXISTS idx_wo_property ON work_orders(property_id);
 CREATE INDEX IF NOT EXISTS idx_wo_unit ON work_orders(unit_id);
 
--- ── Applications (manual record only — no public submission) ─────
+-- ── Applications ─────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS applications (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  org_id INTEGER NOT NULL DEFAULT 1 REFERENCES organizations(id) ON DELETE CASCADE,
   unit_id INTEGER REFERENCES units(id) ON DELETE SET NULL,
   first_name TEXT NOT NULL,
   last_name TEXT NOT NULL,
@@ -161,54 +208,65 @@ CREATE TABLE IF NOT EXISTS applications (
   monthly_income REAL,
   employer TEXT,
   desired_move_in TEXT,
-  status TEXT NOT NULL DEFAULT 'new',          -- 'new' | 'screening' | 'approved' | 'declined' | 'withdrawn'
+  status TEXT NOT NULL DEFAULT 'new',
   notes TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE INDEX IF NOT EXISTS idx_applications_org ON applications(org_id);
 CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status);
 
--- ── Seed data (only inserted on first run) ───────────────────────
-INSERT INTO properties (name, type, address, city, state, zip, color)
-SELECT 'Oakwood Estate', 'single_family', '210 Oakwood Ln', 'Austin', 'TX', '78704', 'emerald'
-WHERE NOT EXISTS (SELECT 1 FROM properties);
+-- ── Seed data for Organization 1 (Apex Property Group) ───────────
+INSERT INTO properties (id, org_id, name, type, address, city, state, zip, color)
+VALUES (1, 1, 'Oakwood Estate', 'single_family', '210 Oakwood Ln', 'Austin', 'TX', '78704', 'emerald');
 
-INSERT INTO properties (name, type, address, city, state, zip, color)
-SELECT 'Honeybee Hideaway', 'single_family', '88 Bramble Ct', 'Austin', 'TX', '78704', 'amber'
-WHERE (SELECT COUNT(*) FROM properties) = 1;
+INSERT INTO properties (id, org_id, name, type, address, city, state, zip, color)
+VALUES (2, 1, 'Honeybee Hideaway', 'single_family', '88 Bramble Ct', 'Austin', 'TX', '78704', 'amber');
 
-INSERT INTO properties (name, type, address, city, state, zip, color)
-SELECT '308 Mission Apartments', 'multi_family', '308 Mission St', 'Austin', 'TX', '78702', 'sky'
-WHERE (SELECT COUNT(*) FROM properties) = 2;
+INSERT INTO properties (id, org_id, name, type, address, city, state, zip, color)
+VALUES (3, 1, '308 Mission Apartments', 'multi_family', '308 Mission St', 'Austin', 'TX', '78702', 'sky');
 
-INSERT INTO units (property_id, name, bedrooms, bathrooms, sqft, market_rent, status)
-SELECT 1, 'Main house', 3, 2, 1450, 2300, 'occupied'
-WHERE NOT EXISTS (SELECT 1 FROM units);
+INSERT INTO units (id, property_id, name, bedrooms, bathrooms, sqft, market_rent, status)
+VALUES (1, 1, 'Main house', 3, 2, 1450, 2300, 'occupied');
 
-INSERT INTO units (property_id, name, bedrooms, bathrooms, sqft, market_rent, status)
-SELECT 2, 'Main house', 2, 1, 980, 1700, 'occupied'
-WHERE (SELECT COUNT(*) FROM units) = 1;
+INSERT INTO units (id, property_id, name, bedrooms, bathrooms, sqft, market_rent, status)
+VALUES (2, 2, 'Main house', 2, 1, 980, 1700, 'occupied');
 
-INSERT INTO units (property_id, name, bedrooms, bathrooms, sqft, market_rent, status)
-SELECT 3, 'Unit 1', 1, 1, 620, 1450, 'occupied'
-WHERE (SELECT COUNT(*) FROM units) = 2;
+INSERT INTO units (id, property_id, name, bedrooms, bathrooms, sqft, market_rent, status)
+VALUES (3, 3, 'Unit 1', 1, 1, 620, 1450, 'occupied');
 
-INSERT INTO units (property_id, name, bedrooms, bathrooms, sqft, market_rent, status)
-SELECT 3, 'Unit 2', 1, 1, 620, 1450, 'vacant'
-WHERE (SELECT COUNT(*) FROM units) = 3;
+INSERT INTO units (id, property_id, name, bedrooms, bathrooms, sqft, market_rent, status)
+VALUES (4, 3, 'Unit 2', 1, 1, 620, 1450, 'vacant');
 
-INSERT INTO units (property_id, name, bedrooms, bathrooms, sqft, market_rent, status)
-SELECT 3, 'Unit 3', 2, 1, 850, 1850, 'occupied'
-WHERE (SELECT COUNT(*) FROM units) = 4;
+INSERT INTO units (id, property_id, name, bedrooms, bathrooms, sqft, market_rent, status)
+VALUES (5, 3, 'Unit 3', 2, 1, 850, 1850, 'occupied');
 
-INSERT INTO vendors (name, category, phone, color)
-SELECT 'Emerald Pool Service', 'general', '512-555-0144', 'emerald'
-WHERE NOT EXISTS (SELECT 1 FROM vendors);
+INSERT INTO vendors (id, org_id, name, category, phone, color)
+VALUES (1, 1, 'Emerald Pool Service', 'general', '512-555-0144', 'emerald');
 
-INSERT INTO vendors (name, category, phone, color)
-SELECT 'Hill Country Plumbing', 'plumber', '512-555-0188', 'sky'
-WHERE (SELECT COUNT(*) FROM vendors) = 1;
+INSERT INTO vendors (id, org_id, name, category, phone, color)
+VALUES (2, 1, 'Hill Country Plumbing', 'plumber', '512-555-0188', 'sky');
 
-INSERT INTO vendors (name, category, phone, color)
-SELECT 'Bright Spark Electric', 'electrician', '512-555-0102', 'amber'
-WHERE (SELECT COUNT(*) FROM vendors) = 2;
+INSERT INTO vendors (id, org_id, name, category, phone, color)
+VALUES (3, 1, 'Bright Spark Electric', 'electrician', '512-555-0102', 'amber');
+
+-- ── Seed data for Organization 2 (Beacon Real Estate) ───────────
+INSERT INTO properties (id, org_id, name, type, address, city, state, zip, color)
+VALUES (10, 2, 'Sunset Tower Plaza', 'commercial', '1200 S Congress Ave', 'Austin', 'TX', '78704', 'violet');
+
+INSERT INTO properties (id, org_id, name, type, address, city, state, zip, color)
+VALUES (11, 2, 'Lakeside Lofts', 'condo', '500 W 2nd St', 'Austin', 'TX', '78701', 'indigo');
+
+INSERT INTO units (id, property_id, name, bedrooms, bathrooms, sqft, market_rent, status)
+VALUES (101, 10, 'Suite 100', 0, 2, 2200, 4500, 'occupied');
+
+INSERT INTO units (id, property_id, name, bedrooms, bathrooms, sqft, market_rent, status)
+VALUES (102, 11, 'Penthouse 4B', 2, 2.5, 1600, 3200, 'occupied');
+
+INSERT INTO vendors (id, org_id, name, category, phone, color)
+VALUES (10, 2, 'Capitol HVAC Solutions', 'hvac', '512-555-0990', 'indigo');
+
+INSERT INTO vendors (id, org_id, name, category, phone, color)
+VALUES (11, 2, 'Austin Clean Tech Services', 'cleaning', '512-555-0771', 'rose');
+
+PRAGMA foreign_keys = ON;

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Pencil, Plus, Trash2 } from "lucide-react";
+import { Building2, Pencil, Plus, ShieldCheck, Trash2 } from "lucide-react";
 import { useApp } from "@/context";
 import { cn, colorClasses } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
@@ -37,15 +37,19 @@ export function SettingsPage() {
       <div className="mx-auto w-full max-w-5xl space-y-6 p-6">
         <header>
           <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
-          <p className="text-sm text-muted-foreground">Vendors and rent policy defaults</p>
+          <p className="text-sm text-muted-foreground">Organization, vendors, and rent policy defaults</p>
         </header>
 
-        <Tabs defaultValue="vendors">
+        <Tabs defaultValue="organization">
           <TabsList>
+            <TabsTrigger value="organization">Organization</TabsTrigger>
             <TabsTrigger value="vendors">Vendors</TabsTrigger>
             <TabsTrigger value="policy">Rent policy</TabsTrigger>
           </TabsList>
 
+          <TabsContent value="organization" className="mt-4">
+            <OrganizationTab />
+          </TabsContent>
           <TabsContent value="vendors" className="mt-4">
             <VendorsTab />
           </TabsContent>
@@ -54,6 +58,50 @@ export function SettingsPage() {
           </TabsContent>
         </Tabs>
       </div>
+    </div>
+  );
+}
+
+// ── Organization Tab ───────────────────────────────────────────────
+
+function OrganizationTab() {
+  const app = useApp();
+  const activeOrg = app.activeOrg;
+
+  return (
+    <div className="space-y-4">
+      <Card className="p-6">
+        <div className="flex items-start justify-between">
+          <div className="flex items-center gap-3">
+            <div className="flex h-12 w-12 items-center justify-center rounded-lg bg-primary/10 text-primary">
+              <Building2 className="h-6 w-6" />
+            </div>
+            <div>
+              <h2 className="text-lg font-semibold tracking-tight">{activeOrg?.name || "Active Organization"}</h2>
+              <p className="text-xs text-muted-foreground font-mono">ID: {activeOrg?.id} · Slug: {activeOrg?.slug}</p>
+            </div>
+          </div>
+          <Badge variant="outline" className="flex items-center gap-1.5 py-1 px-3">
+            <ShieldCheck className="h-3.5 w-3.5 text-primary" />
+            Isolated B2B Tenant
+          </Badge>
+        </div>
+
+        <div className="mt-6 border-t pt-4 grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
+          <div>
+            <span className="text-xs text-muted-foreground uppercase tracking-wider block font-medium">Properties Owned</span>
+            <span className="text-lg font-semibold">{app.properties.length}</span>
+          </div>
+          <div>
+            <span className="text-xs text-muted-foreground uppercase tracking-wider block font-medium">Vendors Listed</span>
+            <span className="text-lg font-semibold">{app.vendors.length}</span>
+          </div>
+          <div>
+            <span className="text-xs text-muted-foreground uppercase tracking-wider block font-medium">Total Organizations</span>
+            <span className="text-lg font-semibold">{app.organizations.length}</span>
+          </div>
+        </div>
+      </Card>
     </div>
   );
 }
@@ -274,7 +322,7 @@ function PolicyTab() {
     <Card className="p-6">
       <h2 className="mb-1 text-sm font-semibold">Rent policy defaults</h2>
       <p className="mb-4 text-xs text-muted-foreground">
-        Used when creating new leases. Each lease can override these.
+        Used when creating new leases for this organization. Each lease can override these.
       </p>
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <div>
