@@ -19,6 +19,12 @@ const intParam = (raw: string | undefined): number | null => {
   return Number.isFinite(n) ? n : null;
 };
 
+const getOrgId = (c: Context): number => {
+  const header = c.req.header("X-Organization-Id");
+  const parsed = intParam(header);
+  return parsed && parsed > 0 ? parsed : 1;
+};
+
 async function parseJson<T>(c: Context, schema: z.ZodType<T>): Promise<{ ok: true; data: T } | { ok: false; error: string }> {
   let body: unknown;
   try {
@@ -40,6 +46,65 @@ function buildUpdate(fields: Record<string, unknown>): { sets: string[]; params:
   return { sets, params };
 }
 
+// ── Organizations ──────────────────────────────────────────────────
+
+const OrganizationInput = z.object({
+  name: z.string().min(1),
+  slug: z.string().optional(),
+  seed_demo_data: z.boolean().optional(),
+});
+
+app.get("/api/organizations", async (c) => {
+  const rows = await query("SELECT * FROM organizations ORDER BY name");
+  return c.json({ organizations: rows });
+});
+
+app.get("/api/organizations/:id", async (c) => {
+  const id = intParam(c.req.param("id"));
+  if (!id) return c.json({ error: "Invalid ID" }, 400);
+  const row = await get("SELECT * FROM organizations WHERE id = ?", [id]);
+  if (!row) return c.json({ error: "Not found" }, 404);
+  return c.json({ organization: row });
+});
+
+app.post("/api/organizations", async (c) => {
+  const parsed = await parseJson(c, OrganizationInput);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const d = parsed.data;
+  const slug = d.slug || d.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  
+  const result = await run(
+    "INSERT INTO organizations (name, slug) VALUES (?, ?)",
+    [d.name, slug],
+  );
+  const orgId = result.lastInsertRowid;
+
+  // Insert default settings for the new organization
+  await run("INSERT OR IGNORE INTO settings (org_id, key, value) VALUES (?, 'default_rent_due_day', '1')", [orgId]);
+  await run("INSERT OR IGNORE INTO settings (org_id, key, value) VALUES (?, 'late_fee_amount', '50')", [orgId]);
+  await run("INSERT OR IGNORE INTO settings (org_id, key, value) VALUES (?, 'late_fee_grace_days', '5')", [orgId]);
+  await run("INSERT OR IGNORE INTO settings (org_id, key, value) VALUES (?, 'currency', 'USD')", [orgId]);
+
+  // Optionally seed sample properties & vendors for a quick-start demo
+  if (d.seed_demo_data) {
+    const p1 = await run(
+      "INSERT INTO properties (org_id, name, type, address, city, state, zip, color) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      [orgId, `${d.name} Plaza`, "multi_family", "100 Main St", "Austin", "TX", "78701", "emerald"],
+    );
+    await run(
+      "INSERT INTO units (property_id, name, bedrooms, bathrooms, sqft, market_rent, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [p1.lastInsertRowid, "Suite 101", 2, 2, 1100, 2100, "vacant"],
+    );
+    await run(
+      "INSERT INTO vendors (org_id, name, category, phone, color) VALUES (?, ?, ?, ?, ?)",
+      [orgId, "Citywide Maintenance", "general", "512-555-0199", "sky"],
+    );
+  }
+
+  const row = await get("SELECT * FROM organizations WHERE id = ?", [orgId]);
+  return c.json({ organization: row }, 201);
+});
+
 // ── Properties ─────────────────────────────────────────────────────
 
 const PropertyInput = z.object({
@@ -55,54 +120,62 @@ const PropertyInput = z.object({
 });
 
 app.get("/api/properties", async (c) => {
+  const orgId = getOrgId(c);
   const rows = await query(
     `SELECT p.*,
        (SELECT COUNT(*) FROM units u WHERE u.property_id = p.id) as unit_count,
        (SELECT COUNT(*) FROM units u WHERE u.property_id = p.id AND u.status = 'occupied') as occupied_count
-     FROM properties p ORDER BY p.name`,
+     FROM properties p 
+     WHERE p.org_id = ?
+     ORDER BY p.name`,
+    [orgId],
   );
   return c.json({ properties: rows });
 });
 
 app.get("/api/properties/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
-  const row = await get("SELECT * FROM properties WHERE id = ?", [id]);
+  const row = await get("SELECT * FROM properties WHERE id = ? AND org_id = ?", [id, orgId]);
   if (!row) return c.json({ error: "Not found" }, 404);
   return c.json({ property: row });
 });
 
 app.post("/api/properties", async (c) => {
+  const orgId = getOrgId(c);
   const parsed = await parseJson(c, PropertyInput);
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const d = parsed.data;
   const result = await run(
-    `INSERT INTO properties (name, type, address, city, state, zip, year_built, notes, color)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [d.name, d.type ?? "single_family", d.address ?? null, d.city ?? null, d.state ?? null, d.zip ?? null, d.year_built ?? null, d.notes ?? null, d.color ?? "sky"],
+    `INSERT INTO properties (org_id, name, type, address, city, state, zip, year_built, notes, color)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [orgId, d.name, d.type ?? "single_family", d.address ?? null, d.city ?? null, d.state ?? null, d.zip ?? null, d.year_built ?? null, d.notes ?? null, d.color ?? "sky"],
   );
   const row = await get("SELECT * FROM properties WHERE id = ?", [result.lastInsertRowid]);
   return c.json({ property: row }, 201);
 });
 
 app.put("/api/properties/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
   const parsed = await parseJson(c, PropertyInput.partial());
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const { sets, params } = buildUpdate(parsed.data);
   if (!sets.length) return c.json({ error: "No fields" }, 400);
-  params.push(id);
-  const r = await run(`UPDATE properties SET ${sets.join(", ")} WHERE id = ?`, params);
+  params.push(id, orgId);
+  const r = await run(`UPDATE properties SET ${sets.join(", ")} WHERE id = ? AND org_id = ?`, params);
   if (!r.changes) return c.json({ error: "Not found" }, 404);
   const row = await get("SELECT * FROM properties WHERE id = ?", [id]);
   return c.json({ property: row });
 });
 
 app.delete("/api/properties/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
-  const r = await run("DELETE FROM properties WHERE id = ?", [id]);
+  const r = await run("DELETE FROM properties WHERE id = ? AND org_id = ?", [id, orgId]);
   if (!r.changes) return c.json({ error: "Not found" }, 404);
   return c.json({ ok: true });
 });
@@ -129,33 +202,40 @@ const UNIT_SELECT = `
     (SELECT l.id FROM leases l WHERE l.unit_id = u.id AND l.status = 'active' ORDER BY l.start_date DESC LIMIT 1) as active_lease_id,
     (SELECT t.first_name || ' ' || t.last_name FROM leases l LEFT JOIN tenants t ON t.id = l.primary_tenant_id WHERE l.unit_id = u.id AND l.status = 'active' ORDER BY l.start_date DESC LIMIT 1) as active_tenant_name
   FROM units u
-  LEFT JOIN properties p ON p.id = u.property_id
+  JOIN properties p ON p.id = u.property_id
 `;
 
 app.get("/api/units", async (c) => {
+  const orgId = getOrgId(c);
   const propertyId = intParam(c.req.query("property_id"));
   const status = c.req.query("status");
-  const where: string[] = [];
-  const params: unknown[] = [];
+  const where: string[] = ["p.org_id = ?"];
+  const params: unknown[] = [orgId];
   if (propertyId) { where.push("u.property_id = ?"); params.push(propertyId); }
   if (status) { where.push("u.status = ?"); params.push(status); }
-  const sql = `${UNIT_SELECT}${where.length ? " WHERE " + where.join(" AND ") : ""} ORDER BY p.name, u.name`;
+  const sql = `${UNIT_SELECT} WHERE ${where.join(" AND ")} ORDER BY p.name, u.name`;
   const rows = await query(sql, params);
   return c.json({ units: rows });
 });
 
 app.get("/api/units/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
-  const row = await get(`${UNIT_SELECT} WHERE u.id = ?`, [id]);
+  const row = await get(`${UNIT_SELECT} WHERE u.id = ? AND p.org_id = ?`, [id, orgId]);
   if (!row) return c.json({ error: "Not found" }, 404);
   return c.json({ unit: row });
 });
 
 app.post("/api/units", async (c) => {
+  const orgId = getOrgId(c);
   const parsed = await parseJson(c, UnitInput);
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const d = parsed.data;
+  // Verify property belongs to this org
+  const prop = await get("SELECT id FROM properties WHERE id = ? AND org_id = ?", [d.property_id, orgId]);
+  if (!prop) return c.json({ error: "Property not found" }, 404);
+
   const result = await run(
     `INSERT INTO units (property_id, name, bedrooms, bathrooms, sqft, market_rent, status, notes)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -166,24 +246,30 @@ app.post("/api/units", async (c) => {
 });
 
 app.put("/api/units/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
+  const existing = await get("SELECT u.id FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = ? AND p.org_id = ?", [id, orgId]);
+  if (!existing) return c.json({ error: "Not found" }, 404);
+
   const parsed = await parseJson(c, UnitInput.partial());
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const { sets, params } = buildUpdate(parsed.data);
   if (!sets.length) return c.json({ error: "No fields" }, 400);
   params.push(id);
-  const r = await run(`UPDATE units SET ${sets.join(", ")} WHERE id = ?`, params);
-  if (!r.changes) return c.json({ error: "Not found" }, 404);
+  await run(`UPDATE units SET ${sets.join(", ")} WHERE id = ?`, params);
   const row = await get(`${UNIT_SELECT} WHERE u.id = ?`, [id]);
   return c.json({ unit: row });
 });
 
 app.delete("/api/units/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
-  const r = await run("DELETE FROM units WHERE id = ?", [id]);
-  if (!r.changes) return c.json({ error: "Not found" }, 404);
+  const existing = await get("SELECT u.id FROM units u JOIN properties p ON p.id = u.property_id WHERE u.id = ? AND p.org_id = ?", [id, orgId]);
+  if (!existing) return c.json({ error: "Not found" }, 404);
+
+  await run("DELETE FROM units WHERE id = ?", [id]);
   return c.json({ ok: true });
 });
 
@@ -202,6 +288,7 @@ const TenantInput = z.object({
 });
 
 app.get("/api/tenants", async (c) => {
+  const orgId = getOrgId(c);
   const search = c.req.query("q")?.trim();
   if (search) {
     const like = `%${search}%`;
@@ -214,9 +301,9 @@ app.get("/api/tenants", async (c) => {
          (SELECT p.name FROM leases l LEFT JOIN units u ON u.id = l.unit_id LEFT JOIN properties p ON p.id = u.property_id
             WHERE l.primary_tenant_id = t.id AND l.status = 'active' LIMIT 1) as active_property_name
        FROM tenants t
-       WHERE t.last_name LIKE ? OR t.first_name LIKE ? OR t.email LIKE ? OR t.phone LIKE ?
+       WHERE t.org_id = ? AND (t.last_name LIKE ? OR t.first_name LIKE ? OR t.email LIKE ? OR t.phone LIKE ?)
        ORDER BY t.last_name, t.first_name LIMIT 200`,
-      [like, like, like, like],
+      [orgId, like, like, like, like],
     );
     return c.json({ tenants: rows });
   }
@@ -228,50 +315,55 @@ app.get("/api/tenants", async (c) => {
           WHERE l.primary_tenant_id = t.id AND l.status = 'active' LIMIT 1) as active_unit_name,
        (SELECT p.name FROM leases l LEFT JOIN units u ON u.id = l.unit_id LEFT JOIN properties p ON p.id = u.property_id
           WHERE l.primary_tenant_id = t.id AND l.status = 'active' LIMIT 1) as active_property_name
-     FROM tenants t ORDER BY t.last_name, t.first_name LIMIT 500`,
+     FROM tenants t WHERE t.org_id = ? ORDER BY t.last_name, t.first_name LIMIT 500`,
+    [orgId],
   );
   return c.json({ tenants: rows });
 });
 
 app.get("/api/tenants/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
-  const row = await get("SELECT * FROM tenants WHERE id = ?", [id]);
+  const row = await get("SELECT * FROM tenants WHERE id = ? AND org_id = ?", [id, orgId]);
   if (!row) return c.json({ error: "Not found" }, 404);
   return c.json({ tenant: row });
 });
 
 app.post("/api/tenants", async (c) => {
+  const orgId = getOrgId(c);
   const parsed = await parseJson(c, TenantInput);
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const d = parsed.data;
   const result = await run(
-    `INSERT INTO tenants (first_name, last_name, email, phone, date_of_birth, emergency_contact, employer, monthly_income, notes)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [d.first_name, d.last_name, d.email ?? null, d.phone ?? null, d.date_of_birth ?? null, d.emergency_contact ?? null, d.employer ?? null, d.monthly_income ?? null, d.notes ?? null],
+    `INSERT INTO tenants (org_id, first_name, last_name, email, phone, date_of_birth, emergency_contact, employer, monthly_income, notes)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [orgId, d.first_name, d.last_name, d.email ?? null, d.phone ?? null, d.date_of_birth ?? null, d.emergency_contact ?? null, d.employer ?? null, d.monthly_income ?? null, d.notes ?? null],
   );
   const row = await get("SELECT * FROM tenants WHERE id = ?", [result.lastInsertRowid]);
   return c.json({ tenant: row }, 201);
 });
 
 app.put("/api/tenants/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
   const parsed = await parseJson(c, TenantInput.partial());
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const { sets, params } = buildUpdate(parsed.data);
   if (!sets.length) return c.json({ error: "No fields" }, 400);
-  params.push(id);
-  const r = await run(`UPDATE tenants SET ${sets.join(", ")} WHERE id = ?`, params);
+  params.push(id, orgId);
+  const r = await run(`UPDATE tenants SET ${sets.join(", ")} WHERE id = ? AND org_id = ?`, params);
   if (!r.changes) return c.json({ error: "Not found" }, 404);
   const row = await get("SELECT * FROM tenants WHERE id = ?", [id]);
   return c.json({ tenant: row });
 });
 
 app.delete("/api/tenants/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
-  const r = await run("DELETE FROM tenants WHERE id = ?", [id]);
+  const r = await run("DELETE FROM tenants WHERE id = ? AND org_id = ?", [id, orgId]);
   if (!r.changes) return c.json({ error: "Not found" }, 404);
   return c.json({ ok: true });
 });
@@ -304,35 +396,38 @@ const LEASE_SELECT = `
 `;
 
 app.get("/api/leases", async (c) => {
+  const orgId = getOrgId(c);
   const status = c.req.query("status");
   const tenantId = intParam(c.req.query("tenant_id"));
   const unitId = intParam(c.req.query("unit_id"));
-  const where: string[] = [];
-  const params: unknown[] = [];
+  const where: string[] = ["l.org_id = ?"];
+  const params: unknown[] = [orgId];
   if (status) { where.push("l.status = ?"); params.push(status); }
   if (tenantId) { where.push("l.primary_tenant_id = ?"); params.push(tenantId); }
   if (unitId) { where.push("l.unit_id = ?"); params.push(unitId); }
-  const sql = `${LEASE_SELECT}${where.length ? " WHERE " + where.join(" AND ") : ""} ORDER BY l.start_date DESC`;
+  const sql = `${LEASE_SELECT} WHERE ${where.join(" AND ")} ORDER BY l.start_date DESC`;
   const rows = await query(sql, params);
   return c.json({ leases: rows });
 });
 
 app.get("/api/leases/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
-  const row = await get(`${LEASE_SELECT} WHERE l.id = ?`, [id]);
+  const row = await get(`${LEASE_SELECT} WHERE l.id = ? AND l.org_id = ?`, [id, orgId]);
   if (!row) return c.json({ error: "Not found" }, 404);
   return c.json({ lease: row });
 });
 
 app.post("/api/leases", async (c) => {
+  const orgId = getOrgId(c);
   const parsed = await parseJson(c, LeaseInput);
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const d = parsed.data;
   const result = await run(
-    `INSERT INTO leases (unit_id, primary_tenant_id, start_date, end_date, monthly_rent, deposit, rent_due_day, late_fee, status, notes)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [d.unit_id, d.primary_tenant_id ?? null, d.start_date, d.end_date, d.monthly_rent ?? 0, d.deposit ?? 0, d.rent_due_day ?? 1, d.late_fee ?? 0, d.status ?? "active", d.notes ?? null],
+    `INSERT INTO leases (org_id, unit_id, primary_tenant_id, start_date, end_date, monthly_rent, deposit, rent_due_day, late_fee, status, notes)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [orgId, d.unit_id, d.primary_tenant_id ?? null, d.start_date, d.end_date, d.monthly_rent ?? 0, d.deposit ?? 0, d.rent_due_day ?? 1, d.late_fee ?? 0, d.status ?? "active", d.notes ?? null],
   );
   // Mark the unit as occupied if the new lease is active.
   if ((d.status ?? "active") === "active") {
@@ -343,23 +438,25 @@ app.post("/api/leases", async (c) => {
 });
 
 app.put("/api/leases/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
   const parsed = await parseJson(c, LeaseInput.partial());
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const { sets, params } = buildUpdate(parsed.data);
   if (!sets.length) return c.json({ error: "No fields" }, 400);
-  params.push(id);
-  const r = await run(`UPDATE leases SET ${sets.join(", ")} WHERE id = ?`, params);
+  params.push(id, orgId);
+  const r = await run(`UPDATE leases SET ${sets.join(", ")} WHERE id = ? AND org_id = ?`, params);
   if (!r.changes) return c.json({ error: "Not found" }, 404);
   const row = await get(`${LEASE_SELECT} WHERE l.id = ?`, [id]);
   return c.json({ lease: row });
 });
 
 app.delete("/api/leases/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
-  const r = await run("DELETE FROM leases WHERE id = ?", [id]);
+  const r = await run("DELETE FROM leases WHERE id = ? AND org_id = ?", [id, orgId]);
   if (!r.changes) return c.json({ error: "Not found" }, 404);
   return c.json({ ok: true });
 });
@@ -388,21 +485,27 @@ const CHARGE_SELECT = `
 `;
 
 app.get("/api/rent-charges", async (c) => {
+  const orgId = getOrgId(c);
   const period = c.req.query("period");
   const status = c.req.query("status");
-  const where: string[] = [];
-  const params: unknown[] = [];
+  const where: string[] = ["l.org_id = ?"];
+  const params: unknown[] = [orgId];
   if (period) { where.push("c.period = ?"); params.push(period); }
   if (status) { where.push("c.status = ?"); params.push(status); }
-  const sql = `${CHARGE_SELECT}${where.length ? " WHERE " + where.join(" AND ") : ""} ORDER BY c.due_date, p.name, u.name`;
+  const sql = `${CHARGE_SELECT} WHERE ${where.join(" AND ")} ORDER BY c.due_date, p.name, u.name`;
   const rows = await query(sql, params).catch(() => []);
   return c.json({ charges: rows });
 });
 
 app.post("/api/rent-charges", async (c) => {
+  const orgId = getOrgId(c);
   const parsed = await parseJson(c, ChargeInput);
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const d = parsed.data;
+  // Verify lease belongs to org
+  const lease = await get("SELECT id FROM leases WHERE id = ? AND org_id = ?", [d.lease_id, orgId]);
+  if (!lease) return c.json({ error: "Lease not found" }, 404);
+
   const result = await run(
     `INSERT INTO rent_charges (lease_id, period, due_date, amount, notes) VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(lease_id, period) DO NOTHING`,
@@ -416,17 +519,18 @@ app.post("/api/rent-charges", async (c) => {
   return c.json({ charge: row }, 201);
 });
 
-// Generate (idempotent) charges for a given period across all active leases.
+// Generate (idempotent) charges for a given period across all active leases for the org.
 app.post("/api/rent-charges/generate", async (c) => {
+  const orgId = getOrgId(c);
   const body = await c.req.json().catch(() => ({})) as { period?: string };
   const period = body.period;
   if (!period || !/^\d{4}-\d{2}$/.test(period)) return c.json({ error: "period (YYYY-MM) required" }, 400);
   const leases = await query<{ id: number; monthly_rent: number; rent_due_day: number; start_date: string; end_date: string }>(
-    "SELECT id, monthly_rent, rent_due_day, start_date, end_date FROM leases WHERE status = 'active'",
+    "SELECT id, monthly_rent, rent_due_day, start_date, end_date FROM leases WHERE org_id = ? AND status = 'active'",
+    [orgId],
   );
   let created = 0;
   for (const l of leases) {
-    // Skip if the lease doesn't cover this period at all.
     const periodStart = `${period}-01`;
     if (l.end_date < periodStart) continue;
     const day = String(Math.min(28, Math.max(1, l.rent_due_day))).padStart(2, "0");
@@ -441,14 +545,20 @@ app.post("/api/rent-charges/generate", async (c) => {
   // Re-mark anything past due as 'overdue'.
   await run(
     `UPDATE rent_charges SET status = 'overdue'
-     WHERE status IN ('open', 'partial') AND amount_paid < amount AND due_date < date('now')`,
+     WHERE lease_id IN (SELECT id FROM leases WHERE org_id = ?)
+       AND status IN ('open', 'partial') AND amount_paid < amount AND due_date < date('now')`,
+    [orgId],
   );
   return c.json({ created, period });
 });
 
 app.put("/api/rent-charges/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
+  const existing = await get("SELECT c.id FROM rent_charges c JOIN leases l ON l.id = c.lease_id WHERE c.id = ? AND l.org_id = ?", [id, orgId]);
+  if (!existing) return c.json({ error: "Not found" }, 404);
+
   const Patch = z.object({
     amount: z.number().min(0).optional(),
     due_date: z.string().optional(),
@@ -460,17 +570,19 @@ app.put("/api/rent-charges/:id", async (c) => {
   const { sets, params } = buildUpdate(parsed.data);
   if (!sets.length) return c.json({ error: "No fields" }, 400);
   params.push(id);
-  const r = await run(`UPDATE rent_charges SET ${sets.join(", ")} WHERE id = ?`, params);
-  if (!r.changes) return c.json({ error: "Not found" }, 404);
+  await run(`UPDATE rent_charges SET ${sets.join(", ")} WHERE id = ?`, params);
   const row = await get(`${CHARGE_SELECT} WHERE c.id = ?`, [id]);
   return c.json({ charge: row });
 });
 
 app.delete("/api/rent-charges/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
-  const r = await run("DELETE FROM rent_charges WHERE id = ?", [id]);
-  if (!r.changes) return c.json({ error: "Not found" }, 404);
+  const existing = await get("SELECT c.id FROM rent_charges c JOIN leases l ON l.id = c.lease_id WHERE c.id = ? AND l.org_id = ?", [id, orgId]);
+  if (!existing) return c.json({ error: "Not found" }, 404);
+
+  await run("DELETE FROM rent_charges WHERE id = ?", [id]);
   return c.json({ ok: true });
 });
 
@@ -484,39 +596,53 @@ const PaymentInput = z.object({
 });
 
 app.get("/api/rent-charges/:id/payments", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
+  const existing = await get("SELECT c.id FROM rent_charges c JOIN leases l ON l.id = c.lease_id WHERE c.id = ? AND l.org_id = ?", [id, orgId]);
+  if (!existing) return c.json({ error: "Not found" }, 404);
+
   const rows = await query("SELECT * FROM payments WHERE charge_id = ? ORDER BY paid_at DESC", [id]);
   return c.json({ payments: rows });
 });
 
 app.post("/api/payments", async (c) => {
+  const orgId = getOrgId(c);
   const parsed = await parseJson(c, PaymentInput);
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const d = parsed.data;
+
+  const existingCharge = await get<{ amount: number }>(
+    "SELECT c.amount FROM rent_charges c JOIN leases l ON l.id = c.lease_id WHERE c.id = ? AND l.org_id = ?",
+    [d.charge_id, orgId],
+  );
+  if (!existingCharge) return c.json({ error: "Charge not found" }, 404);
+
   await run(
     `INSERT INTO payments (charge_id, paid_at, amount, method, reference, notes)
      VALUES (?, COALESCE(?, datetime('now')), ?, ?, ?, ?)`,
     [d.charge_id, d.paid_at ?? null, d.amount, d.method ?? "cash", d.reference ?? null, d.notes ?? null],
   );
-  // Recompute the charge's amount_paid + status.
-  const charge = await get<{ amount: number }>("SELECT amount FROM rent_charges WHERE id = ?", [d.charge_id]);
-  if (!charge) return c.json({ error: "Charge not found" }, 404);
+
   const sumRow = await get<{ total: number }>("SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE charge_id = ?", [d.charge_id]);
   const paid = Number(sumRow?.total ?? 0);
-  const status = paid >= charge.amount ? "paid" : paid > 0 ? "partial" : "open";
+  const status = paid >= existingCharge.amount ? "paid" : paid > 0 ? "partial" : "open";
   await run("UPDATE rent_charges SET amount_paid = ?, status = ? WHERE id = ?", [paid, status, d.charge_id]);
   const updated = await get(`${CHARGE_SELECT} WHERE c.id = ?`, [d.charge_id]);
   return c.json({ charge: updated }, 201);
 });
 
 app.delete("/api/payments/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
-  const row = await get<{ charge_id: number }>("SELECT charge_id FROM payments WHERE id = ?", [id]);
+  const row = await get<{ charge_id: number }>(
+    "SELECT p.charge_id FROM payments p JOIN rent_charges c ON c.id = p.charge_id JOIN leases l ON l.id = c.lease_id WHERE p.id = ? AND l.org_id = ?",
+    [id, orgId],
+  );
   if (!row) return c.json({ error: "Not found" }, 404);
   await run("DELETE FROM payments WHERE id = ?", [id]);
-  // Recompute the charge.
+  
   const sumRow = await get<{ total: number }>("SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE charge_id = ?", [row.charge_id]);
   const charge = await get<{ amount: number }>("SELECT amount FROM rent_charges WHERE id = ?", [row.charge_id]);
   const paid = Number(sumRow?.total ?? 0);
@@ -537,40 +663,44 @@ const VendorInput = z.object({
 });
 
 app.get("/api/vendors", async (c) => {
-  const rows = await query("SELECT * FROM vendors ORDER BY name");
+  const orgId = getOrgId(c);
+  const rows = await query("SELECT * FROM vendors WHERE org_id = ? ORDER BY name", [orgId]);
   return c.json({ vendors: rows });
 });
 
 app.post("/api/vendors", async (c) => {
+  const orgId = getOrgId(c);
   const parsed = await parseJson(c, VendorInput);
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const d = parsed.data;
   const result = await run(
-    "INSERT INTO vendors (name, category, phone, email, notes, color) VALUES (?, ?, ?, ?, ?, ?)",
-    [d.name, d.category ?? "general", d.phone ?? null, d.email ?? null, d.notes ?? null, d.color ?? "slate"],
+    "INSERT INTO vendors (org_id, name, category, phone, email, notes, color) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    [orgId, d.name, d.category ?? "general", d.phone ?? null, d.email ?? null, d.notes ?? null, d.color ?? "slate"],
   );
   const row = await get("SELECT * FROM vendors WHERE id = ?", [result.lastInsertRowid]);
   return c.json({ vendor: row }, 201);
 });
 
 app.put("/api/vendors/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
   const parsed = await parseJson(c, VendorInput.partial());
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const { sets, params } = buildUpdate(parsed.data);
   if (!sets.length) return c.json({ error: "No fields" }, 400);
-  params.push(id);
-  const r = await run(`UPDATE vendors SET ${sets.join(", ")} WHERE id = ?`, params);
+  params.push(id, orgId);
+  const r = await run(`UPDATE vendors SET ${sets.join(", ")} WHERE id = ? AND org_id = ?`, params);
   if (!r.changes) return c.json({ error: "Not found" }, 404);
   const row = await get("SELECT * FROM vendors WHERE id = ?", [id]);
   return c.json({ vendor: row });
 });
 
 app.delete("/api/vendors/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
-  const r = await run("DELETE FROM vendors WHERE id = ?", [id]);
+  const r = await run("DELETE FROM vendors WHERE id = ? AND org_id = ?", [id, orgId]);
   if (!r.changes) return c.json({ error: "Not found" }, 404);
   return c.json({ ok: true });
 });
@@ -606,13 +736,14 @@ const WO_SELECT = `
 `;
 
 app.get("/api/work-orders", async (c) => {
+  const orgId = getOrgId(c);
   const status = c.req.query("status");
   const propertyId = intParam(c.req.query("property_id"));
-  const where: string[] = [];
-  const params: unknown[] = [];
+  const where: string[] = ["w.org_id = ?"];
+  const params: unknown[] = [orgId];
   if (status) { where.push("w.status = ?"); params.push(status); }
   if (propertyId) { where.push("w.property_id = ?"); params.push(propertyId); }
-  const sql = `${WO_SELECT}${where.length ? " WHERE " + where.join(" AND ") : ""} ORDER BY
+  const sql = `${WO_SELECT} WHERE ${where.join(" AND ")} ORDER BY
     CASE w.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,
     w.created_at DESC`;
   const rows = await query(sql, params).catch(() => []);
@@ -620,14 +751,15 @@ app.get("/api/work-orders", async (c) => {
 });
 
 app.post("/api/work-orders", async (c) => {
+  const orgId = getOrgId(c);
   const parsed = await parseJson(c, WorkOrderInput);
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const d = parsed.data;
   const result = await run(
-    `INSERT INTO work_orders (property_id, unit_id, tenant_id, vendor_id, title, description, priority, status, scheduled_at, completed_at, cost, notes)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO work_orders (org_id, property_id, unit_id, tenant_id, vendor_id, title, description, priority, status, scheduled_at, completed_at, cost, notes)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
-      d.property_id ?? null, d.unit_id ?? null, d.tenant_id ?? null, d.vendor_id ?? null,
+      orgId, d.property_id ?? null, d.unit_id ?? null, d.tenant_id ?? null, d.vendor_id ?? null,
       d.title, d.description ?? null,
       d.priority ?? "normal", d.status ?? "open",
       d.scheduled_at ?? null, d.completed_at ?? null,
@@ -639,23 +771,25 @@ app.post("/api/work-orders", async (c) => {
 });
 
 app.put("/api/work-orders/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
   const parsed = await parseJson(c, WorkOrderInput.partial());
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const { sets, params } = buildUpdate(parsed.data);
   if (!sets.length) return c.json({ error: "No fields" }, 400);
-  params.push(id);
-  const r = await run(`UPDATE work_orders SET ${sets.join(", ")} WHERE id = ?`, params);
+  params.push(id, orgId);
+  const r = await run(`UPDATE work_orders SET ${sets.join(", ")} WHERE id = ? AND org_id = ?`, params);
   if (!r.changes) return c.json({ error: "Not found" }, 404);
   const row = await get(`${WO_SELECT} WHERE w.id = ?`, [id]);
   return c.json({ work_order: row });
 });
 
 app.delete("/api/work-orders/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
-  const r = await run("DELETE FROM work_orders WHERE id = ?", [id]);
+  const r = await run("DELETE FROM work_orders WHERE id = ? AND org_id = ?", [id, orgId]);
   if (!r.changes) return c.json({ error: "Not found" }, 404);
   return c.json({ ok: true });
 });
@@ -676,25 +810,29 @@ const ApplicationInput = z.object({
 });
 
 app.get("/api/applications", async (c) => {
+  const orgId = getOrgId(c);
   const rows = await query(
     `SELECT a.*, u.name as unit_name, p.name as property_name
      FROM applications a
      LEFT JOIN units u ON u.id = a.unit_id
      LEFT JOIN properties p ON p.id = u.property_id
+     WHERE a.org_id = ?
      ORDER BY a.created_at DESC`,
+    [orgId],
   ).catch(() => []);
   return c.json({ applications: rows });
 });
 
 app.post("/api/applications", async (c) => {
+  const orgId = getOrgId(c);
   const parsed = await parseJson(c, ApplicationInput);
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const d = parsed.data;
   const result = await run(
-    `INSERT INTO applications (unit_id, first_name, last_name, email, phone, monthly_income, employer, desired_move_in, status, notes)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO applications (org_id, unit_id, first_name, last_name, email, phone, monthly_income, employer, desired_move_in, status, notes)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
-      d.unit_id ?? null, d.first_name, d.last_name,
+      orgId, d.unit_id ?? null, d.first_name, d.last_name,
       d.email ?? null, d.phone ?? null, d.monthly_income ?? null, d.employer ?? null,
       d.desired_move_in ?? null, d.status ?? "new", d.notes ?? null,
     ],
@@ -709,14 +847,15 @@ app.post("/api/applications", async (c) => {
 });
 
 app.put("/api/applications/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
   const parsed = await parseJson(c, ApplicationInput.partial());
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const { sets, params } = buildUpdate(parsed.data);
   if (!sets.length) return c.json({ error: "No fields" }, 400);
-  params.push(id);
-  const r = await run(`UPDATE applications SET ${sets.join(", ")} WHERE id = ?`, params);
+  params.push(id, orgId);
+  const r = await run(`UPDATE applications SET ${sets.join(", ")} WHERE id = ? AND org_id = ?`, params);
   if (!r.changes) return c.json({ error: "Not found" }, 404);
   const row = await get(
     `SELECT a.*, u.name as unit_name, p.name as property_name
@@ -728,9 +867,10 @@ app.put("/api/applications/:id", async (c) => {
 });
 
 app.delete("/api/applications/:id", async (c) => {
+  const orgId = getOrgId(c);
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
-  const r = await run("DELETE FROM applications WHERE id = ?", [id]);
+  const r = await run("DELETE FROM applications WHERE id = ? AND org_id = ?", [id, orgId]);
   if (!r.changes) return c.json({ error: "Not found" }, 404);
   return c.json({ ok: true });
 });
@@ -738,6 +878,7 @@ app.delete("/api/applications/:id", async (c) => {
 // ── Dashboard summary ──────────────────────────────────────────────
 
 app.get("/api/dashboard/summary", async (c) => {
+  const orgId = getOrgId(c);
   const today = new Date().toISOString().slice(0, 10);
   const periodNow = today.slice(0, 7);
 
@@ -761,43 +902,50 @@ app.get("/api/dashboard/summary", async (c) => {
     recentWorkOrders,
     upcomingExpirations,
   ] = await Promise.all([
-    safeGet<{ n: number }>("SELECT COUNT(*) as n FROM properties", [], { n: 0 }),
-    safeGet<{ n: number }>("SELECT COUNT(*) as n FROM units", [], { n: 0 }),
-    safeGet<{ n: number }>("SELECT COUNT(*) as n FROM units WHERE status = 'occupied'", [], { n: 0 }),
-    safeGet<{ n: number }>("SELECT COUNT(*) as n FROM units WHERE status = 'vacant'", [], { n: 0 }),
-    safeGet<{ n: number }>("SELECT COUNT(*) as n FROM leases WHERE status = 'active'", [], { n: 0 }),
+    safeGet<{ n: number }>("SELECT COUNT(*) as n FROM properties WHERE org_id = ?", [orgId], { n: 0 }),
+    safeGet<{ n: number }>("SELECT COUNT(*) as n FROM units u JOIN properties p ON p.id = u.property_id WHERE p.org_id = ?", [orgId], { n: 0 }),
+    safeGet<{ n: number }>("SELECT COUNT(*) as n FROM units u JOIN properties p ON p.id = u.property_id WHERE p.org_id = ? AND u.status = 'occupied'", [orgId], { n: 0 }),
+    safeGet<{ n: number }>("SELECT COUNT(*) as n FROM units u JOIN properties p ON p.id = u.property_id WHERE p.org_id = ? AND u.status = 'vacant'", [orgId], { n: 0 }),
+    safeGet<{ n: number }>("SELECT COUNT(*) as n FROM leases WHERE org_id = ? AND status = 'active'", [orgId], { n: 0 }),
     safeGet<{ n: number }>(
-      "SELECT COUNT(*) as n FROM leases WHERE status = 'active' AND end_date <= date('now', '+30 days')",
-      [], { n: 0 },
+      "SELECT COUNT(*) as n FROM leases WHERE org_id = ? AND status = 'active' AND end_date <= date('now', '+30 days')",
+      [orgId], { n: 0 },
     ),
     safeGet<{ total: number }>(
-      "SELECT COALESCE(SUM(amount - amount_paid), 0) as total FROM rent_charges WHERE period = ? AND status != 'waived'",
-      [periodNow], { total: 0 },
+      `SELECT COALESCE(SUM(c.amount - c.amount_paid), 0) as total 
+       FROM rent_charges c JOIN leases l ON l.id = c.lease_id 
+       WHERE l.org_id = ? AND c.period = ? AND c.status != 'waived'`,
+      [orgId, periodNow], { total: 0 },
     ),
     safeGet<{ total: number }>(
-      "SELECT COALESCE(SUM(amount_paid), 0) as total FROM rent_charges WHERE period = ?",
-      [periodNow], { total: 0 },
+      `SELECT COALESCE(SUM(c.amount_paid), 0) as total 
+       FROM rent_charges c JOIN leases l ON l.id = c.lease_id 
+       WHERE l.org_id = ? AND c.period = ?`,
+      [orgId, periodNow], { total: 0 },
     ),
     safeGet<{ total: number; n: number }>(
-      "SELECT COALESCE(SUM(amount - amount_paid), 0) as total, COUNT(*) as n FROM rent_charges WHERE due_date < date('now') AND amount_paid < amount AND status != 'waived'",
-      [], { total: 0, n: 0 },
+      `SELECT COALESCE(SUM(c.amount - c.amount_paid), 0) as total, COUNT(*) as n 
+       FROM rent_charges c JOIN leases l ON l.id = c.lease_id 
+       WHERE l.org_id = ? AND c.due_date < date('now') AND c.amount_paid < c.amount AND c.status != 'waived'`,
+      [orgId], { total: 0, n: 0 },
     ),
     safeGet<{ n: number }>(
-      "SELECT COUNT(*) as n FROM work_orders WHERE status NOT IN ('completed', 'cancelled')",
-      [], { n: 0 },
+      "SELECT COUNT(*) as n FROM work_orders WHERE org_id = ? AND status NOT IN ('completed', 'cancelled')",
+      [orgId], { n: 0 },
     ),
     safeGet<{ n: number }>(
-      "SELECT COUNT(*) as n FROM work_orders WHERE priority = 'urgent' AND status NOT IN ('completed', 'cancelled')",
-      [], { n: 0 },
+      "SELECT COUNT(*) as n FROM work_orders WHERE org_id = ? AND priority = 'urgent' AND status NOT IN ('completed', 'cancelled')",
+      [orgId], { n: 0 },
     ),
     safeQuery<{ id: number; title: string; priority: string; status: string; property_name: string | null; unit_name: string | null; created_at: string }>(
       `SELECT w.id, w.title, w.priority, w.status, p.name as property_name, u.name as unit_name, w.created_at
        FROM work_orders w
        LEFT JOIN properties p ON p.id = w.property_id
        LEFT JOIN units u ON u.id = w.unit_id
-       WHERE w.status NOT IN ('completed', 'cancelled')
+       WHERE w.org_id = ? AND w.status NOT IN ('completed', 'cancelled')
        ORDER BY CASE w.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, w.created_at DESC
        LIMIT 6`,
+      [orgId],
     ),
     safeQuery<{ id: number; end_date: string; tenant_first_name: string | null; tenant_last_name: string | null; unit_name: string | null; property_name: string | null }>(
       `SELECT l.id, l.end_date,
@@ -807,8 +955,9 @@ app.get("/api/dashboard/summary", async (c) => {
        LEFT JOIN tenants t ON t.id = l.primary_tenant_id
        LEFT JOIN units u ON u.id = l.unit_id
        LEFT JOIN properties p ON p.id = u.property_id
-       WHERE l.status = 'active' AND l.end_date <= date('now', '+60 days')
+       WHERE l.org_id = ? AND l.status = 'active' AND l.end_date <= date('now', '+60 days')
        ORDER BY l.end_date ASC LIMIT 6`,
+      [orgId],
     ),
   ]);
 
@@ -832,28 +981,30 @@ app.get("/api/dashboard/summary", async (c) => {
   });
 });
 
-// ── Settings (key/value) ───────────────────────────────────────────
+// ── Settings (key/value per org) ───────────────────────────────────
 
 app.get("/api/settings", async (c) => {
-  const rows = await query<{ key: string; value: string }>("SELECT key, value FROM settings").catch(() => []);
+  const orgId = getOrgId(c);
+  const rows = await query<{ key: string; value: string }>("SELECT key, value FROM settings WHERE org_id = ?", [orgId]).catch(() => []);
   const out: Record<string, string> = {};
   for (const r of rows) out[r.key] = r.value;
   return c.json({ settings: out });
 });
 
 app.put("/api/settings", async (c) => {
+  const orgId = getOrgId(c);
   let body: unknown;
   try { body = await c.req.json(); } catch { return c.json({ error: "Invalid JSON" }, 400); }
   if (!body || typeof body !== "object") return c.json({ error: "Body must be an object" }, 400);
   const entries = Object.entries(body as Record<string, unknown>).filter(([, v]) => v !== undefined && v !== null);
   for (const [key, value] of entries) {
     await run(
-      `INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now'))
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
-      [key, String(value)],
+      `INSERT INTO settings (org_id, key, value, updated_at) VALUES (?, ?, ?, datetime('now'))
+       ON CONFLICT(org_id, key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
+      [orgId, key, String(value)],
     );
   }
-  const rows = await query<{ key: string; value: string }>("SELECT key, value FROM settings");
+  const rows = await query<{ key: string; value: string }>("SELECT key, value FROM settings WHERE org_id = ?", [orgId]);
   const out: Record<string, string> = {};
   for (const r of rows) out[r.key] = r.value;
   return c.json({ settings: out });

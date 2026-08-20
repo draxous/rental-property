@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 import type {
+  Organization,
+  NewOrganization,
   Property,
   Unit,
   Tenant,
@@ -44,11 +46,46 @@ function parseSettings(raw: Record<string, string>): AppSettings {
 }
 
 export function useAppState() {
+  const [organizations, setOrganizations] = useState<Organization[]>([]);
+  const [activeOrg, setActiveOrg] = useState<Organization | null>(null);
   const [properties, setProperties] = useState<Property[]>([]);
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Organizations ───────────────────────────────────────────────────
+
+  const loadOrganizations = useCallback(async () => {
+    const data = await api<{ organizations: Organization[] }>("GET", "/api/organizations");
+    setOrganizations(data.organizations);
+    
+    const storedId = localStorage.getItem("active_org_id");
+    let current = data.organizations.find((o) => String(o.id) === storedId);
+    if (!current && data.organizations.length > 0) {
+      current = data.organizations[0];
+    }
+    if (current) {
+      localStorage.setItem("active_org_id", String(current.id));
+      setActiveOrg(current);
+    }
+    return data.organizations;
+  }, []);
+
+  const switchOrganization = useCallback(async (orgId: number) => {
+    const target = organizations.find((o) => o.id === orgId);
+    if (!target) return;
+    localStorage.setItem("active_org_id", String(orgId));
+    setActiveOrg(target);
+  }, [organizations]);
+
+  const createOrganization = useCallback(async (input: NewOrganization) => {
+    const res = await api<{ organization: Organization }>("POST", "/api/organizations", input);
+    await loadOrganizations();
+    localStorage.setItem("active_org_id", String(res.organization.id));
+    setActiveOrg(res.organization);
+    return res.organization;
+  }, [loadOrganizations]);
 
   // Lookup loaders ─────────────────────────────────────────────────
 
@@ -77,6 +114,21 @@ export function useAppState() {
     (async () => {
       try {
         setLoading(true);
+        await loadOrganizations();
+      } catch (err) {
+        setError((err as Error).message);
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [loadOrganizations]);
+
+  // Re-fetch lookups when activeOrg changes
+  useEffect(() => {
+    if (!activeOrg) return;
+    (async () => {
+      try {
+        setLoading(true);
         await refreshLookups();
       } catch (err) {
         setError((err as Error).message);
@@ -84,7 +136,7 @@ export function useAppState() {
         setLoading(false);
       }
     })();
-  }, [refreshLookups]);
+  }, [activeOrg, refreshLookups]);
 
   // Property mutations ─────────────────────────────────────────────
 
@@ -251,6 +303,8 @@ export function useAppState() {
   }, []);
 
   return {
+    // organization state & methods
+    organizations, activeOrg, switchOrganization, createOrganization,
     // data
     properties, vendors, settings,
     loading, error, setError,

@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Route } from "@/hooks/use-router";
+import { OrgSwitcher } from "./org-switcher";
 
 interface NavItem {
   label: string;
@@ -57,6 +58,10 @@ export function Sidebar({
           <Home className="h-4 w-4" />
         </div>
         <span className="text-base font-semibold tracking-tight">Open Property</span>
+      </div>
+
+      <div className="p-2 border-b">
+        <OrgSwitcher />
       </div>
 
       <nav className="flex-1 overflow-y-auto px-2 py-3">
