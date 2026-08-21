@@ -12,6 +12,7 @@ import { LeasesPage } from "./components/leases/leases-page";
 import { RentPage } from "./components/rent/rent-page";
 import { MaintenancePage } from "./components/maintenance/maintenance-page";
 import { SettingsPage } from "./components/settings/settings-page";
+import { AdminPage } from "./components/admin/admin-page";
 
 export function App() {
   const state = useAppState();
@@ -37,6 +38,7 @@ export function App() {
               {route.name === "rent" && <RentPage />}
               {route.name === "maintenance" && <MaintenancePage />}
               {route.name === "settings" && <SettingsPage />}
+              {route.name === "admin" && <AdminPage />}
               {route.name === "not-found" && (
                 <Placeholder title="Not found" message="That page doesn't exist." />
               )}

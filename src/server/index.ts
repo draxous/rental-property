@@ -1,6 +1,7 @@
 import { Hono, type Context } from "hono";
 import { z } from "zod";
 import { initDB, query, get, run } from "./db";
+import { paymentRegistry } from "./payments/registry";
 
 type Env = { Bindings: { DB: D1Database } };
 
@@ -981,33 +982,318 @@ app.get("/api/dashboard/summary", async (c) => {
   });
 });
 
-// ── Settings (key/value per org) ───────────────────────────────────
+// ── Admin Only Payment Gateway Management ──────────────────────────
 
-app.get("/api/settings", async (c) => {
-  const orgId = getOrgId(c);
-  const rows = await query<{ key: string; value: string }>("SELECT key, value FROM settings WHERE org_id = ?", [orgId]).catch(() => []);
-  const out: Record<string, string> = {};
-  for (const r of rows) out[r.key] = r.value;
-  return c.json({ settings: out });
+app.get("/api/admin/gateways", async (c) => {
+  const rows = await query<{ id: string; name: string; type: string; is_enabled: number; config_json: string; updated_at: string }>(
+    "SELECT * FROM payment_gateways ORDER BY name",
+  ).catch(() => []);
+  
+  const registered = paymentRegistry.list();
+  const gateways = registered.map((mod) => {
+    const dbRow = rows.find((r) => r.id === mod.id);
+    let parsedConfig: Record<string, string> = {};
+    if (dbRow?.config_json) {
+      try { parsedConfig = JSON.parse(dbRow.config_json); } catch { /* empty */ }
+    }
+    return {
+      id: mod.id,
+      name: mod.name,
+      type: mod.type,
+      description: mod.description,
+      supported_methods: mod.supportedMethods,
+      default_config_keys: mod.defaultConfigKeys,
+      is_enabled: dbRow ? Boolean(dbRow.is_enabled) : true,
+      config: parsedConfig,
+      updated_at: dbRow?.updated_at || new Date().toISOString(),
+    };
+  });
+
+  return c.json({ gateways });
 });
 
-app.put("/api/settings", async (c) => {
-  const orgId = getOrgId(c);
-  let body: unknown;
-  try { body = await c.req.json(); } catch { return c.json({ error: "Invalid JSON" }, 400); }
-  if (!body || typeof body !== "object") return c.json({ error: "Body must be an object" }, 400);
-  const entries = Object.entries(body as Record<string, unknown>).filter(([, v]) => v !== undefined && v !== null);
-  for (const [key, value] of entries) {
-    await run(
-      `INSERT INTO settings (org_id, key, value, updated_at) VALUES (?, ?, ?, datetime('now'))
-       ON CONFLICT(org_id, key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
-      [orgId, key, String(value)],
-    );
+app.put("/api/admin/gateways/:id", async (c) => {
+  const gatewayId = c.req.param("id");
+  const mod = paymentRegistry.get(gatewayId);
+  if (!mod) return c.json({ error: "Unknown gateway module" }, 404);
+
+  const GatewayPatch = z.object({
+    is_enabled: z.boolean().optional(),
+    config: z.record(z.string()).optional(),
+  });
+
+  const parsed = await parseJson(c, GatewayPatch);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+
+  const existing = await get<{ config_json: string; is_enabled: number }>(
+    "SELECT config_json, is_enabled FROM payment_gateways WHERE id = ?",
+    [gatewayId],
+  );
+
+  let currentConfig: Record<string, string> = {};
+  if (existing?.config_json) {
+    try { currentConfig = JSON.parse(existing.config_json); } catch { /* empty */ }
   }
-  const rows = await query<{ key: string; value: string }>("SELECT key, value FROM settings WHERE org_id = ?", [orgId]);
-  const out: Record<string, string> = {};
-  for (const r of rows) out[r.key] = r.value;
-  return c.json({ settings: out });
+
+  const updatedConfig = { ...currentConfig, ...(parsed.data.config || {}) };
+  const isEnabled = parsed.data.is_enabled !== undefined ? (parsed.data.is_enabled ? 1 : 0) : (existing?.is_enabled ?? 1);
+
+  await run(
+    `INSERT INTO payment_gateways (id, name, type, is_enabled, config_json, updated_at)
+     VALUES (?, ?, ?, ?, ?, datetime('now'))
+     ON CONFLICT(id) DO UPDATE SET is_enabled = excluded.is_enabled, config_json = excluded.config_json, updated_at = datetime('now')`,
+    [gatewayId, mod.name, mod.type, isEnabled, JSON.stringify(updatedConfig)],
+  );
+
+  return c.json({
+    gateway: {
+      id: mod.id,
+      name: mod.name,
+      type: mod.type,
+      description: mod.description,
+      supported_methods: mod.supportedMethods,
+      is_enabled: Boolean(isEnabled),
+      config: updatedConfig,
+    },
+  });
+});
+
+app.get("/api/admin/org-assignments", async (c) => {
+  const rows = await query(
+    `SELECT o.id as org_id, o.name as org_name,
+            opa.gateway_id, pg.name as gateway_name, pg.type as gateway_type,
+            opa.assigned_at
+     FROM organizations o
+     LEFT JOIN org_payment_assignments opa ON opa.org_id = o.id
+     LEFT JOIN payment_gateways pg ON pg.id = opa.gateway_id
+     ORDER BY o.name`,
+  ).catch(() => []);
+  return c.json({ assignments: rows });
+});
+
+app.put("/api/admin/org-assignments/:orgId", async (c) => {
+  const orgId = intParam(c.req.param("orgId"));
+  if (!orgId) return c.json({ error: "Invalid orgId" }, 400);
+
+  const Body = z.object({ gateway_id: z.string().min(1) });
+  const parsed = await parseJson(c, Body);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+
+  const mod = paymentRegistry.get(parsed.data.gateway_id);
+  if (!mod) return c.json({ error: "Invalid gateway_id" }, 400);
+
+  await run(
+    `INSERT INTO org_payment_assignments (org_id, gateway_id, assigned_at)
+     VALUES (?, ?, datetime('now'))
+     ON CONFLICT(org_id) DO UPDATE SET gateway_id = excluded.gateway_id, assigned_at = datetime('now')`,
+    [orgId, parsed.data.gateway_id],
+  );
+
+  return c.json({ ok: true, org_id: orgId, gateway_id: parsed.data.gateway_id });
+});
+
+app.get("/api/admin/transactions", async (c) => {
+  const rows = await query(
+    `SELECT ft.*, o.name as org_name, pg.name as gateway_name,
+            t.first_name || ' ' || t.last_name as tenant_name,
+            u.name as unit_name
+     FROM financial_transactions ft
+     LEFT JOIN organizations o ON o.id = ft.org_id
+     LEFT JOIN payment_gateways pg ON pg.id = ft.gateway_id
+     LEFT JOIN recurring_subscriptions sub ON sub.id = ft.subscription_id
+     LEFT JOIN tenants t ON t.id = sub.tenant_id
+     LEFT JOIN leases l ON l.id = sub.lease_id
+     LEFT JOIN units u ON u.id = l.unit_id
+     ORDER BY ft.created_at DESC LIMIT 500`,
+  ).catch(() => []);
+  return c.json({ transactions: rows });
+});
+
+// ── Organization Payment & Recurring Billing Endpoints ───────────
+
+app.get("/api/payments/config", async (c) => {
+  const orgId = getOrgId(c);
+  const row = await get<{ gateway_id: string; gateway_name: string; gateway_type: string; is_enabled: number; config_json: string }>(
+    `SELECT opa.gateway_id, pg.name as gateway_name, pg.type as gateway_type, pg.is_enabled, pg.config_json
+     FROM org_payment_assignments opa
+     JOIN payment_gateways pg ON pg.id = opa.gateway_id
+     WHERE opa.org_id = ?`,
+    [orgId],
+  );
+
+  if (!row || !row.is_enabled) {
+    return c.json({
+      configured: false,
+      message: "No active payment gateway configured by Admin for this organization.",
+    });
+  }
+
+  const mod = paymentRegistry.get(row.gateway_id);
+  return c.json({
+    configured: true,
+    gateway: {
+      id: row.gateway_id,
+      name: row.gateway_name,
+      type: row.gateway_type,
+      supported_methods: mod?.supportedMethods || ["card"],
+    },
+  });
+});
+
+app.get("/api/payments/subscriptions", async (c) => {
+  const orgId = getOrgId(c);
+  const rows = await query(
+    `SELECT s.*, u.name as unit_name, p.name as property_name,
+            t.first_name as tenant_first_name, t.last_name as tenant_last_name,
+            pg.name as gateway_name
+     FROM recurring_subscriptions s
+     LEFT JOIN leases l ON l.id = s.lease_id
+     LEFT JOIN units u ON u.id = l.unit_id
+     LEFT JOIN properties p ON p.id = u.property_id
+     LEFT JOIN tenants t ON t.id = s.tenant_id
+     LEFT JOIN payment_gateways pg ON pg.id = s.gateway_id
+     WHERE s.org_id = ?
+     ORDER BY s.created_at DESC`,
+    [orgId],
+  ).catch(() => []);
+  return c.json({ subscriptions: rows });
+});
+
+app.post("/api/payments/subscriptions", async (c) => {
+  const orgId = getOrgId(c);
+  const Schema = z.object({
+    lease_id: z.number().int(),
+    payment_method: z.enum(["card", "direct_debit"]).optional(),
+  });
+  const parsed = await parseJson(c, Schema);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+
+  const assignment = await get<{ gateway_id: string; config_json: string }>(
+    `SELECT opa.gateway_id, pg.config_json
+     FROM org_payment_assignments opa
+     JOIN payment_gateways pg ON pg.id = opa.gateway_id
+     WHERE opa.org_id = ? AND pg.is_enabled = 1`,
+    [orgId],
+  );
+  if (!assignment) return c.json({ error: "No active payment gateway assigned by Admin to this organization." }, 400);
+
+  const mod = paymentRegistry.get(assignment.gateway_id);
+  if (!mod) return c.json({ error: "Payment gateway module unavailable" }, 500);
+
+  const lease = await get<{ id: number; primary_tenant_id: number; monthly_rent: number; tenant_name: string; tenant_email: string }>(
+    `SELECT l.id, l.primary_tenant_id, l.monthly_rent,
+            t.first_name || ' ' || t.last_name as tenant_name, t.email as tenant_email
+     FROM leases l
+     LEFT JOIN tenants t ON t.id = l.primary_tenant_id
+     WHERE l.id = ? AND l.org_id = ?`,
+    [parsed.data.lease_id, orgId],
+  );
+  if (!lease) return c.json({ error: "Lease not found" }, 404);
+
+  let gatewayConfig: Record<string, string> = {};
+  try { gatewayConfig = JSON.parse(assignment.config_json || "{}"); } catch { /* empty */ }
+
+  const subResult = await mod.createRecurringSubscription({
+    subscriptionId: `SUB-${lease.id}`,
+    amount: lease.monthly_rent,
+    currency: "LKR",
+    customer: { name: lease.tenant_name || "Tenant", email: lease.tenant_email || "tenant@example.com" },
+    period: "MONTHLY",
+    paymentMethod: parsed.data.payment_method || "card",
+    config: gatewayConfig,
+  });
+
+  const res = await run(
+    `INSERT INTO recurring_subscriptions (org_id, lease_id, tenant_id, gateway_id, gateway_subscription_id, gateway_token, payment_method, amount, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')`,
+    [
+      orgId, lease.id, lease.primary_tenant_id ?? null,
+      assignment.gateway_id, subResult.gatewaySubscriptionId, subResult.token,
+      parsed.data.payment_method || "card", lease.monthly_rent,
+    ],
+  );
+
+  const subRow = await get("SELECT * FROM recurring_subscriptions WHERE id = ?", [res.lastInsertRowid]);
+  return c.json({ subscription: subRow, redirectUrl: subResult.redirectUrl }, 201);
+});
+
+app.post("/api/payments/process-recurring", async (c) => {
+  const orgId = getOrgId(c);
+  const Schema = z.object({ charge_id: z.number().int() });
+  const parsed = await parseJson(c, Schema);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+
+  const charge = await get<{ id: number; lease_id: number; amount: number; amount_paid: number; period: string }>(
+    `SELECT c.id, c.lease_id, c.amount, c.amount_paid, c.period
+     FROM rent_charges c
+     JOIN leases l ON l.id = c.lease_id
+     WHERE c.id = ? AND l.org_id = ?`,
+    [parsed.data.charge_id, orgId],
+  );
+  if (!charge) return c.json({ error: "Rent charge not found" }, 404);
+
+  const dueAmount = charge.amount - charge.amount_paid;
+  if (dueAmount <= 0) return c.json({ error: "Charge is already fully paid" }, 400);
+
+  const sub = await get<{ id: number; gateway_id: string; gateway_subscription_id: string; gateway_token: string }>(
+    `SELECT id, gateway_id, gateway_subscription_id, gateway_token
+     FROM recurring_subscriptions
+     WHERE lease_id = ? AND org_id = ? AND status = 'active'
+     ORDER BY created_at DESC LIMIT 1`,
+    [charge.lease_id, orgId],
+  );
+
+  if (!sub) return c.json({ error: "No active recurring mandate/subscription found for this lease." }, 400);
+
+  const gatewayRow = await get<{ config_json: string }>(
+    "SELECT config_json FROM payment_gateways WHERE id = ?",
+    [sub.gateway_id],
+  );
+  let gatewayConfig: Record<string, string> = {};
+  if (gatewayRow?.config_json) {
+    try { gatewayConfig = JSON.parse(gatewayRow.config_json); } catch { /* empty */ }
+  }
+
+  const mod = paymentRegistry.get(sub.gateway_id);
+  if (!mod) return c.json({ error: "Gateway module unavailable" }, 500);
+
+  const chargeRes = await mod.chargeRecurringPayment({
+    subscriptionId: sub.gateway_subscription_id,
+    amount: dueAmount,
+    currency: "LKR",
+    token: sub.gateway_token,
+    config: gatewayConfig,
+  });
+
+  // Log transaction
+  await run(
+    `INSERT INTO financial_transactions (org_id, subscription_id, charge_id, gateway_id, transaction_id, amount, status, response_data)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      orgId, sub.id, charge.id, sub.gateway_id,
+      chargeRes.transactionId, dueAmount,
+      chargeRes.status, JSON.stringify(chargeRes.rawResponse || {}),
+    ],
+  );
+
+  if (chargeRes.success) {
+    // Record payment against rent charge
+    await run(
+      `INSERT INTO payments (charge_id, paid_at, amount, method, reference, notes)
+       VALUES (?, datetime('now'), ?, 'credit', ?, ?)`,
+      [charge.id, dueAmount, chargeRes.transactionId, `Auto-debit via ${mod.name}`],
+    );
+
+    const sumRow = await get<{ total: number }>("SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE charge_id = ?", [charge.id]);
+    const paid = Number(sumRow?.total ?? 0);
+    const status = paid >= charge.amount ? "paid" : "partial";
+    await run("UPDATE rent_charges SET amount_paid = ?, status = ? WHERE id = ?", [paid, status, charge.id]);
+
+    const updatedCharge = await get("SELECT * FROM rent_charges WHERE id = ?", [charge.id]);
+    return c.json({ success: true, charge: updatedCharge, transaction_id: chargeRes.transactionId });
+  }
+
+  return c.json({ success: false, error: chargeRes.message || "Recurring charge failed" }, 400);
 });
 
 // ── Health ─────────────────────────────────────────────────────────

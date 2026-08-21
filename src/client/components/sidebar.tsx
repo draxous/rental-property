@@ -7,6 +7,7 @@ import {
   LayoutDashboard,
   Receipt,
   Home,
+  ShieldCheck,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Route } from "@/hooks/use-router";
@@ -39,7 +40,8 @@ const sections: { heading: string; items: NavItem[] }[] = [
   {
     heading: "Admin",
     items: [
-      { label: "Settings", icon: Settings, path: "/settings", match: (r) => r.name === "settings" },
+      { label: "Settings",    icon: Settings,    path: "/settings", match: (r) => r.name === "settings" },
+      { label: "Admin Panel", icon: ShieldCheck, path: "/admin",    match: (r) => r.name === "admin" },
     ],
   },
 ];

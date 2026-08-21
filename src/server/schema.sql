@@ -1,6 +1,10 @@
 PRAGMA foreign_keys = OFF;
 
 -- ── Drop old tables if upgrading ─────────────────────────────────
+DROP TABLE IF EXISTS financial_transactions;
+DROP TABLE IF EXISTS recurring_subscriptions;
+DROP TABLE IF EXISTS org_payment_assignments;
+DROP TABLE IF EXISTS payment_gateways;
 DROP TABLE IF EXISTS settings;
 DROP TABLE IF EXISTS lease_tenants;
 DROP TABLE IF EXISTS payments;
@@ -38,12 +42,83 @@ CREATE TABLE IF NOT EXISTS settings (
 INSERT INTO settings (org_id, key, value) VALUES (1, 'default_rent_due_day', '1');
 INSERT INTO settings (org_id, key, value) VALUES (1, 'late_fee_amount', '50');
 INSERT INTO settings (org_id, key, value) VALUES (1, 'late_fee_grace_days', '5');
-INSERT INTO settings (org_id, key, value) VALUES (1, 'currency', 'USD');
+INSERT INTO settings (org_id, key, value) VALUES (1, 'currency', 'LKR');
 
 INSERT INTO settings (org_id, key, value) VALUES (2, 'default_rent_due_day', '1');
 INSERT INTO settings (org_id, key, value) VALUES (2, 'late_fee_amount', '75');
 INSERT INTO settings (org_id, key, value) VALUES (2, 'late_fee_grace_days', '3');
-INSERT INTO settings (org_id, key, value) VALUES (2, 'currency', 'USD');
+INSERT INTO settings (org_id, key, value) VALUES (2, 'currency', 'LKR');
+
+-- ── Payment Gateways (Admin Platform Level) ─────────────────────
+CREATE TABLE IF NOT EXISTS payment_gateways (
+  id TEXT PRIMARY KEY,                       -- 'payhere' | 'lankapay'
+  name TEXT NOT NULL,
+  type TEXT NOT NULL,                        -- 'payhere' | 'lankapay'
+  is_enabled INTEGER NOT NULL DEFAULT 1,     -- 1 = active, 0 = disabled
+  config_json TEXT NOT NULL DEFAULT '{}',    -- Admin credentials (merchant_id, secret, sandbox mode, etc.)
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+INSERT INTO payment_gateways (id, name, type, is_enabled, config_json) VALUES (
+  'payhere',
+  'PayHere Sri Lanka (Recurring Cards)',
+  'payhere',
+  1,
+  '{"merchant_id":"1220001","merchant_secret":"payhere_sec_demo_9982","app_id":"4UPH9982","app_secret":"ph_app_secret_demo","sandbox":"true"}'
+);
+
+INSERT INTO payment_gateways (id, name, type, is_enabled, config_json) VALUES (
+  'lankapay',
+  'LankaPay DirectDebit / Card',
+  'lankapay',
+  1,
+  '{"merchant_code":"LK_PAY_APEX_01","api_key":"lkp_live_secret_key_88192","security_cert":"lkp_cert_base64_demo","sandbox":"true"}'
+);
+
+-- ── Organization Payment Assignments (Managed ONLY by Admin) ────
+CREATE TABLE IF NOT EXISTS org_payment_assignments (
+  org_id INTEGER PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+  gateway_id TEXT NOT NULL REFERENCES payment_gateways(id) ON DELETE RESTRICT,
+  assigned_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+INSERT INTO org_payment_assignments (org_id, gateway_id) VALUES (1, 'payhere');
+INSERT INTO org_payment_assignments (org_id, gateway_id) VALUES (2, 'lankapay');
+
+-- ── Recurring Subscriptions (Card/Direct Debit Tokenized Mandates) ─
+CREATE TABLE IF NOT EXISTS recurring_subscriptions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  org_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  lease_id INTEGER NOT NULL REFERENCES leases(id) ON DELETE CASCADE,
+  tenant_id INTEGER REFERENCES tenants(id) ON DELETE SET NULL,
+  gateway_id TEXT NOT NULL REFERENCES payment_gateways(id) ON DELETE RESTRICT,
+  gateway_subscription_id TEXT,
+  gateway_token TEXT,
+  payment_method TEXT NOT NULL DEFAULT 'card', -- 'card' | 'direct_debit'
+  amount REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'active',       -- 'active' | 'paused' | 'cancelled'
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_subs_org ON recurring_subscriptions(org_id);
+CREATE INDEX IF NOT EXISTS idx_subs_lease ON recurring_subscriptions(lease_id);
+
+-- ── Financial Transactions (Payment Gateway Audit Ledger) ────────
+CREATE TABLE IF NOT EXISTS financial_transactions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  org_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  subscription_id INTEGER REFERENCES recurring_subscriptions(id) ON DELETE SET NULL,
+  charge_id INTEGER REFERENCES rent_charges(id) ON DELETE SET NULL,
+  gateway_id TEXT NOT NULL,
+  transaction_id TEXT NOT NULL,
+  amount REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'success',      -- 'success' | 'failed' | 'pending'
+  response_data TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_trans_org ON financial_transactions(org_id);
+CREATE INDEX IF NOT EXISTS idx_trans_status ON financial_transactions(status);
 
 -- ── Properties (buildings) ───────────────────────────────────────
 CREATE TABLE IF NOT EXISTS properties (

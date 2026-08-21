@@ -13,10 +13,69 @@ export type NewOrganization = {
   seed_demo_data?: boolean;
 };
 
+// ── Payment Gateways & Admin Financial entities ─────────────────────
+
+export interface PaymentGateway {
+  id: string; // 'payhere' | 'lankapay'
+  name: string;
+  type: "payhere" | "lankapay";
+  is_enabled: boolean;
+  config: Record<string, string>;
+  updated_at: string;
+}
+
+export interface OrgPaymentAssignment {
+  org_id: number;
+  org_name?: string;
+  gateway_id: string;
+  gateway_name?: string;
+  gateway_type?: "payhere" | "lankapay";
+  assigned_at: string;
+}
+
+export interface RecurringSubscription {
+  id: number;
+  org_id: number;
+  lease_id: number;
+  tenant_id: number | null;
+  gateway_id: string;
+  gateway_subscription_id: string | null;
+  gateway_token: string | null;
+  payment_method: "card" | "direct_debit";
+  amount: number;
+  status: "active" | "paused" | "cancelled";
+  created_at: string;
+  // Joined
+  unit_name?: string | null;
+  property_name?: string | null;
+  tenant_first_name?: string | null;
+  tenant_last_name?: string | null;
+  gateway_name?: string | null;
+}
+
+export interface FinancialTransaction {
+  id: number;
+  org_id: number;
+  subscription_id: number | null;
+  charge_id: number | null;
+  gateway_id: string;
+  transaction_id: string;
+  amount: number;
+  status: "success" | "failed" | "pending";
+  response_data: string | null;
+  created_at: string;
+  // Joined
+  org_name?: string | null;
+  gateway_name?: string | null;
+  tenant_name?: string | null;
+  unit_name?: string | null;
+}
+
 export type PropertyType = "single_family" | "multi_family" | "condo" | "townhouse" | "commercial";
 
 export interface Property {
   id: number;
+  org_id: number;
   name: string;
   type: PropertyType;
   address: string | null;
@@ -56,6 +115,7 @@ export interface Unit {
 
 export interface Tenant {
   id: number;
+  org_id: number;
   first_name: string;
   last_name: string;
   email: string | null;
@@ -76,6 +136,7 @@ export type LeaseStatus = "upcoming" | "active" | "ended" | "cancelled";
 
 export interface Lease {
   id: number;
+  org_id: number;
   unit_id: number;
   primary_tenant_id: number | null;
   start_date: string;
@@ -139,6 +200,7 @@ export type VendorCategory = "plumber" | "electrician" | "hvac" | "handyman" | "
 
 export interface Vendor {
   id: number;
+  org_id: number;
   name: string;
   category: VendorCategory;
   phone: string | null;
@@ -153,6 +215,7 @@ export type WorkOrderStatus = "open" | "assigned" | "in_progress" | "completed" 
 
 export interface WorkOrder {
   id: number;
+  org_id: number;
   property_id: number | null;
   unit_id: number | null;
   tenant_id: number | null;
@@ -180,6 +243,7 @@ export type ApplicationStatus = "new" | "screening" | "approved" | "declined" | 
 
 export interface Application {
   id: number;
+  org_id: number;
   unit_id: number | null;
   first_name: string;
   last_name: string;
@@ -223,10 +287,11 @@ export interface DashboardSummary {
 
 // ── Input types for mutations ──────────────────────────────────────
 
-export type NewProperty = Partial<Omit<Property, "id" | "created_at" | "unit_count" | "occupied_count">> & { name: string };
+export type NewProperty = Partial<Omit<Property, "id" | "org_id" | "created_at" | "unit_count" | "occupied_count">> & { name: string };
 export type NewUnit = Partial<Omit<Unit, "id" | "created_at" | "property_name" | "property_color" | "property_address" | "property_city" | "active_lease_id" | "active_tenant_name">> & { property_id: number; name: string };
-export type NewTenant = Partial<Omit<Tenant, "id" | "created_at" | "active_unit_id" | "active_unit_name" | "active_property_name">> & { first_name: string; last_name: string };
-export type NewLease = Partial<Omit<Lease, "id" | "created_at" | "unit_name" | "property_id" | "property_name" | "property_color" | "tenant_first_name" | "tenant_last_name" | "tenant_email" | "tenant_phone">> & { unit_id: number; start_date: string; end_date: string };
-export type NewWorkOrder = Partial<Omit<WorkOrder, "id" | "created_at" | "property_name" | "property_color" | "unit_name" | "tenant_first_name" | "tenant_last_name" | "vendor_name" | "vendor_color">> & { title: string };
-export type NewVendor = Partial<Omit<Vendor, "id" | "created_at">> & { name: string };
-export type NewApplication = Partial<Omit<Application, "id" | "created_at" | "unit_name" | "property_name">> & { first_name: string; last_name: string };
+export type NewTenant = Partial<Omit<Tenant, "id" | "org_id" | "created_at" | "active_unit_id" | "active_unit_name" | "active_property_name">> & { first_name: string; last_name: string };
+export type NewLease = Partial<Omit<Lease, "id" | "org_id" | "created_at" | "unit_name" | "property_id" | "property_name" | "property_color" | "tenant_first_name" | "tenant_last_name" | "tenant_email" | "tenant_phone">> & { unit_id: number; start_date: string; end_date: string };
+export type NewWorkOrder = Partial<Omit<WorkOrder, "id" | "org_id" | "created_at" | "property_name" | "property_color" | "unit_name" | "tenant_first_name" | "tenant_last_name" | "vendor_name" | "vendor_color">> & { title: string };
+export type NewVendor = Partial<Omit<Vendor, "id" | "org_id" | "created_at">> & { name: string };
+export type NewApplication = Partial<Omit<Application, "id" | "org_id" | "created_at" | "unit_name" | "property_name">> & { first_name: string; last_name: string };
+export type NewSubscription = { lease_id: number; payment_method: "card" | "direct_debit" };

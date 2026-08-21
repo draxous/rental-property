@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { ChevronLeft, ChevronRight, Receipt, Sparkles } from "lucide-react";
+import { ChevronLeft, ChevronRight, CreditCard, Lock, Receipt, Sparkles, Zap } from "lucide-react";
+import { api } from "@/api";
 import { useApp } from "@/context";
 import { addMonths, cn, currentPeriod, formatDate, formatMoney, formatPeriod } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
@@ -17,6 +18,16 @@ const STATUS_TONE: Record<ChargeStatus, string> = {
   waived: "bg-slate-100 text-slate-700 border-slate-200",
 };
 
+interface GatewayConfigInfo {
+  configured: boolean;
+  gateway?: {
+    id: string;
+    name: string;
+    type: string;
+    supported_methods: string[];
+  };
+}
+
 export function RentPage() {
   const app = useApp();
   const [period, setPeriod] = useState<string>(currentPeriod());
@@ -24,12 +35,18 @@ export function RentPage() {
   const [loading, setLoading] = useState(true);
   const [paymentTarget, setPaymentTarget] = useState<RentCharge | null>(null);
   const [generating, setGenerating] = useState(false);
+  const [gwConfig, setGwConfig] = useState<GatewayConfigInfo | null>(null);
+  const [debitingId, setDebitingId] = useState<number | null>(null);
 
   async function load() {
     try {
       setLoading(true);
-      const list = await app.listCharges(period);
+      const [list, gw] = await Promise.all([
+        app.listCharges(period),
+        api<GatewayConfigInfo>("GET", "/api/payments/config").catch(() => ({ configured: false })),
+      ]);
       setCharges(list);
+      setGwConfig(gw);
     } catch (err) {
       app.setError((err as Error).message);
     } finally {
@@ -52,6 +69,23 @@ export function RentPage() {
     }
   }
 
+  async function processAutoDebit(chargeId: number) {
+    try {
+      setDebitingId(chargeId);
+      const res = await api<{ success: boolean; transaction_id: string }>("POST", "/api/payments/process-recurring", {
+        charge_id: chargeId,
+      });
+      if (res.success) {
+        alert(`Recurring payment succeeded! Transaction ID: ${res.transaction_id}`);
+        await load();
+      }
+    } catch (err) {
+      alert((err as Error).message);
+    } finally {
+      setDebitingId(null);
+    }
+  }
+
   const totals = useMemo(() => {
     const charged = charges.reduce((s, c) => s + (c.amount ?? 0), 0);
     const collected = charges.reduce((s, c) => s + (c.amount_paid ?? 0), 0);
@@ -67,9 +101,23 @@ export function RentPage() {
       <div className="mx-auto w-full max-w-7xl space-y-6 p-6">
         <header className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
           <div>
-            <h1 className="text-2xl font-semibold tracking-tight">Rent ledger</h1>
-            <p className="text-sm text-muted-foreground">Charges and payments per period</p>
+            <div className="flex items-center gap-3">
+              <h1 className="text-2xl font-semibold tracking-tight">Rent ledger</h1>
+              {gwConfig?.configured && gwConfig.gateway ? (
+                <Badge variant="outline" className="flex items-center gap-1.5 py-1 text-xs border-primary/30 text-primary">
+                  <CreditCard className="h-3.5 w-3.5" />
+                  Assigned Gateway: {gwConfig.gateway.name}
+                </Badge>
+              ) : (
+                <Badge variant="secondary" className="flex items-center gap-1.5 py-1 text-xs text-muted-foreground">
+                  <Lock className="h-3.5 w-3.5" />
+                  No Active Gateway Assigned by Admin
+                </Badge>
+              )}
+            </div>
+            <p className="text-sm text-muted-foreground mt-0.5">Charges, automated recurring payments, and payments ledger</p>
           </div>
+
           <div className="flex items-center gap-2">
             <div className="inline-flex items-center rounded-md border bg-background p-1">
               <Button variant="ghost" size="icon" onClick={() => setPeriod((p) => addMonths(p, -1))} aria-label="Previous month">
@@ -135,7 +183,7 @@ export function RentPage() {
                   <TableHead className="text-right">Paid</TableHead>
                   <TableHead className="text-right">Balance</TableHead>
                   <TableHead>Status</TableHead>
-                  <TableHead></TableHead>
+                  <TableHead className="text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -168,17 +216,31 @@ export function RentPage() {
                           {c.status}
                         </span>
                       </TableCell>
-                      <TableCell>
-                        {c.status !== "paid" && c.status !== "waived" && (
-                          <Button size="sm" variant="outline" onClick={() => setPaymentTarget(c)}>
-                            Record payment
-                          </Button>
-                        )}
-                        {(c.status === "paid" || c.amount_paid > 0) && (
-                          <Button size="sm" variant="ghost" onClick={() => setPaymentTarget(c)}>
-                            View
-                          </Button>
-                        )}
+                      <TableCell className="text-right">
+                        <div className="flex items-center justify-end gap-2">
+                          {c.status !== "paid" && c.status !== "waived" && gwConfig?.configured && (
+                            <Button
+                              size="sm"
+                              variant="default"
+                              className="bg-emerald-600 hover:bg-emerald-700 text-white"
+                              disabled={debitingId === c.id}
+                              onClick={() => processAutoDebit(c.id)}
+                            >
+                              <Zap className="mr-1 h-3.5 w-3.5" />
+                              {debitingId === c.id ? "Debiting…" : "Auto-Debit"}
+                            </Button>
+                          )}
+                          {c.status !== "paid" && c.status !== "waived" && (
+                            <Button size="sm" variant="outline" onClick={() => setPaymentTarget(c)}>
+                              Record payment
+                            </Button>
+                          )}
+                          {(c.status === "paid" || c.amount_paid > 0) && (
+                            <Button size="sm" variant="ghost" onClick={() => setPaymentTarget(c)}>
+                              View
+                            </Button>
+                          )}
+                        </div>
                       </TableCell>
                     </TableRow>
                   );
